@@ -11,7 +11,7 @@ except ImportError:
 
 
 class VESC(object):
-    def __init__(self, serial_port, has_sensor=False, start_heartbeat=True, baudrate=115200, timeout=0.05):
+    def __init__(self, serial_port, has_sensor=False, start_heartbeat=False, baudrate=115200, timeout=None):
         """
         :param serial_port: Serial device to use for communication (i.e. "COM3" or "/dev/tty.usbmodem0")
         :param has_sensor: Whether or not the bldc motor is using a hall effect sensor
@@ -24,7 +24,7 @@ class VESC(object):
         if serial is None:
             raise ImportError("Need to install pyserial in order to use the VESCMotor class.")
 
-        self.serial_port = serial.Serial(port=serial_port, baudrate=baudrate, timeout=timeout)
+        self.serial_port = serial.Serial(port=serial_port, baudrate=baudrate, write_timeout=0) # changed timeout=timeout to write_timeout=0
         if has_sensor:
             self.serial_port.write(encode(SetRotorPositionMode(SetRotorPositionMode.DISP_POS_OFF)))
 
@@ -37,9 +37,16 @@ class VESC(object):
             self.start_heartbeat()
 
         # check firmware version and set GetValue fields to old values if pre version 3.xx
-        version = self.get_firmware_version()
-        if int(version.split('.')[0]) < 3:
-            GetValues.fields = pre_v3_33_fields
+        while True:
+            try:
+                version = self.get_firmware_version()
+                if int(version.split('.')[0]) < 3:
+                    GetValues.fields = pre_v3_33_fields
+                break
+            except Exception as e:
+                print(f"Error getting firmware version: {e}")
+                print("Retrying ...")
+                time.sleep(0.1)
 
         # store message info for getting values so it doesn't need to calculate it every time
         msg = GetValues()
@@ -125,21 +132,33 @@ class VESC(object):
         """
         self.write(encode(SetServoPosition(new_servo_pos, **kwargs)))
 
-    def get_measurements(self):
+    def get_measurements(self, **kwargs):
         """
         :return: A msg object with attributes containing the measurement values
         """
-        return self.write(self._get_values_msg, num_read_bytes=self._get_values_msg_expected_length)
+        return self.write(encode_request(GetValues(**kwargs)), num_read_bytes=self._get_values_msg_expected_length)
 
     def get_firmware_version(self):
         msg = GetVersion()
         return str(self.write(encode_request(msg), num_read_bytes=msg._full_msg_size))
+    
+    def set_pos(self, new_pos, **kwargs):
+        """
+        :param new_pos: New  position. valid range [0, 360.0]
+        """
+        self.write(encode(SetPosition(new_pos, **kwargs)))
 
     def get_rpm(self):
         """
         :return: Current motor rpm
         """
         return self.get_measurements().rpm
+    
+    def get_pos(self, **kwargs):
+        """
+        :return: Current motor position
+        """
+        return self.get_measurements(**kwargs).pid_pos_now
 
     def get_duty_cycle(self):
         """
