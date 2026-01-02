@@ -77,3 +77,30 @@ class GetRotorPosition(metaclass=VESCMessage):
     fields = [
             ('rotor_pos', 'i', 100000)
     ]
+
+class GetIMUData(metaclass=VESCMessage):
+    """ Gets IMU data
+    """
+    id = VedderCmd.COMM_GET_IMU_DATA
+
+    fields = [
+        # ('packet_id', 'c', 0),
+        ('mask', 'h', 0),
+        # ('rpy_x', 'i', 0),
+        # ('rpy_y', 'i', 0),
+        # ('rpy_z', 'i', 0),
+        # ('acc_x', 'i', 0),
+        # ('acc_y', 'i', 0),
+        # ('acc_z', 'i', 0),
+        # ('gyro_x', 'i', 0),
+        # ('gyro_y', 'i', 0),
+        # ('gyro_z', 'i', 0),
+        # ('mag_x', 'i', 0),
+        # ('mag_y', 'i', 0),
+        # ('mag_z', 'i', 0),
+        ('quad_w', 'i', 0),
+        ('quad_x', 'i', 0),
+        ('quad_y', 'i', 0),
+        ('quad_z', 'i', 0),
+        ('app_controller_id', 'c', 0),
+    ]
