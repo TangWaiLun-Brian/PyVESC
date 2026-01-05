@@ -160,12 +160,12 @@ class AsyncVESC_TCP:
         - 0xFFFF : Everything (including quaternion if firmware supports it)
         """
         # Build payload: command ID (1 byte) + mask (2 bytes big-endian)
-        payload = struct.pack('>BH', 65, mask)  # > = big-endian, B=uint8, H=uint16
+        payload = struct.pack('>BH', VedderCmd.COMM_GET_IMU_DATA, mask)  # > = big-endian, B=uint8, H=uint16
         
         if can_id is not None:
             # For CAN forwarding: prepend COMM_FORWARD_CAN (usually 34) + can_id
             # Adjust 34 if your firmware uses a different value (rare)
-            payload = struct.pack('>BB', 34, can_id) + payload
+            payload = struct.pack('>BB', VedderCmd.COMM_FORWARD_CAN, can_id) + payload
         
         # Encode the full VESC packet (handles start/stop bytes, length, CRC)
         packet = pyvesc.protocol.packet.codec.frame(payload)
