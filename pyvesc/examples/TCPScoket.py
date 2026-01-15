@@ -1,11 +1,26 @@
 import asyncio
+import serial_asyncio
+import serial
 import pyvesc
 from pyvesc.VESC.messages import *
 from pyvesc.VESC.messages.setters import SetDutyCycle, SetCurrent, SetRPM
-from pyvesc.VESC.messages.getters import GetValues, GetRotorPosition, GetIMUData
+from pyvesc.VESC.messages.getters import GetValues, GetRotorPosition, GetIMUData, GetMcConf
 from typing import Optional
 import struct
 import math
+from enum import Enum, auto
+
+class CommMode(Enum):
+    SERIAL = auto()
+    TCP = auto()
+    UDP = auto()
+
+class ControlMode(Enum):
+    DUTY_CYCLE = auto()
+    CURRENT = auto()
+    RPM = auto()
+    POSITION = auto()
+
 
 def decode_float32_auto(raw_uint32: int) -> float:
     """Decode a float encoded with buffer_append_float32_auto"""
@@ -37,9 +52,10 @@ def buffer_get_float32_auto(buffer: bytes, index: int) -> float:
     return decode_float32_auto(raw)
 
 class AsyncVESC_TCP:
-    def __init__(self, host: str, port: int = 65102):
+    def __init__(self, host: str, port: int = 65102, commMode: CommMode = CommMode.SERIAL):
         self.host = host
         self.port = port
+        self.commMode = commMode
         self.reader: Optional[asyncio.StreamReader] = None
         self.writer: Optional[asyncio.StreamWriter] = None
         self.buffer = bytearray()
@@ -48,8 +64,20 @@ class AsyncVESC_TCP:
 
     async def connect(self):
         """Establish TCP connection and start background receive task"""
-        self.reader, self.writer = await asyncio.open_connection(self.host, self.port)
-        print(f"Connected to VESC at {self.host}:{self.port}")
+        if self.commMode == CommMode.TCP:
+            self.reader, self.writer = await asyncio.open_connection(self.host, self.port)
+            print(f"Connected to VESC at {self.host}:{self.port} via TCP")
+        elif self.commMode == CommMode.SERIAL:
+            self.reader, self.writer = await serial_asyncio.open_serial_connection(
+            url=self.host,              # ← this is the important part
+            baudrate=115200,         # change to your device's baud rate
+            parity=serial.PARITY_NONE,
+            stopbits=serial.STOPBITS_ONE,
+            bytesize=serial.EIGHTBITS,
+            timeout=1
+            )
+            print(f"Connected to VESC at {self.host} via SERIAL")
+
 
         # Start background task for receiving and handling messages
         self._receive_task = asyncio.create_task(self._receive_loop())
@@ -115,6 +143,15 @@ class AsyncVESC_TCP:
             quad_y = decode_float32_auto(msg.quad_y)
             quad_z = decode_float32_auto(msg.quad_z)
             print(f"   Quaternion: w={quad_w:.4f}, x={quad_x:.4f}, y={quad_y:.4f}, z={quad_z:.4f}")
+            
+        # Mc Config
+        if isinstance(msg, GetMcConf):
+            print(f"motor current max: {msg.l_current_max} A")
+            print(f"motor current min: {msg.l_current_min} A")
+            print(f"motor in current max: {msg.l_in_current_max} A")
+            print(f"motor in current min: {msg.l_in_current_min} A")
+            print(f"motor flux linkage: {msg.foc_motor_flux_linkage} mWb")
+            print(f"foc observer gain: {msg.foc_observer_gain}")
 
     async def _send_packet(self, packet: bytes):
         """Internal: send raw packet with lock to prevent interleaving"""
@@ -124,20 +161,20 @@ class AsyncVESC_TCP:
 
     # === Synchronous-style command functions ===
 
-    async def set_position(self, degrees: float, can_id=117):
+    async def set_position(self, degrees: float, **kwargs):
         """Send COMM_SET_POS (position control)"""
-        packet = pyvesc.encode(SetPosition(degrees, can_id=can_id))
+        packet = pyvesc.encode(SetPosition(degrees, **kwargs))
         await self._send_packet(packet)
         print(f"→ Sent SetPos: {degrees}°")
 
-    async def set_duty_cycle(self, duty: float):
+    async def set_duty_cycle(self, duty: float, **kwargs):
         """Duty cycle from -1.0 to 1.0"""
         packet = pyvesc.encode(SetDutyCycle(duty))
         await self._send_packet(packet)
         print(f"→ Sent SetDutyCycle: {duty:.3f}")
 
-    async def set_current(self, current_amps: float):
-        packet = pyvesc.encode(SetCurrent(current_amps))
+    async def set_current(self, current_amps: float, **kwargs):
+        packet = pyvesc.encode(SetCurrent(current_amps, **kwargs))
         await self._send_packet(packet)
         print(f"→ Sent SetCurrent: {current_amps:.2f}A")
 
@@ -151,6 +188,12 @@ class AsyncVESC_TCP:
         packet = pyvesc.encode_request(GetValues(can_id=117))
         await self._send_packet(packet)
         print("→ Requested GetValues")
+
+    async def get_motor_config(self, **kwargs):
+        """Send COMM_GET_MCCONF to request motor configuration"""
+        packet = pyvesc.encode_request(GetMcConf(**kwargs))
+        await self._send_packet(packet)
+        print("→ Requested Motor Configuration (COMM_GET_MCCONF)")
 
     async def request_imu_data(self, mask: int = 0xFFFF, can_id: int | None = None):
         """
@@ -176,26 +219,39 @@ class AsyncVESC_TCP:
         print(f"→ Requested IMU Data (mask=0x{mask:04X}){target}")
 # === Example Usage ===
 async def main():
-    vesc = AsyncVESC_TCP("192.168.0.146", 65102)  # Replace with your TCP bridge IP
-
+    # vesc = AsyncVESC_TCP("192.168.0.146", 65102)  # Replace with your TCP bridge IP
+    vesc = AsyncVESC_TCP("COM4", commMode=CommMode.SERIAL)  # Replace with your serial port
+    can_id = None
     try:
         await vesc.connect()
 
-        # Example: send position commands synchronously
-        # await vesc.set_position(0.0)
+        # # Example: send position commands synchronously
+        # await vesc.set_position(0.0, can_id=can_id)
         # await asyncio.sleep(2)
 
-        # await vesc.set_position(90.0)
+        # await vesc.set_position(90.0, can_id=can_id)
         # await asyncio.sleep(2)
 
-        # await vesc.set_position(180.0)
+        # await vesc.set_position(180.0, can_id=can_id)
         # await asyncio.sleep(2)
 
-        # Request telemetry periodically
-        while True:
-            # await vesc.request_values()
-            await vesc.request_imu_data(mask=0xF000, can_id=117)
-            await asyncio.sleep(0.5)
+        # Example: current control
+        await vesc.set_current(1.0)  # 0.1A
+        await asyncio.sleep(2)
+        await vesc.set_current(0.0)  # 0.1A
+        await asyncio.sleep(2)
+
+
+        # # Request imu data
+        # while True:
+        #     await vesc.request_imu_data(mask=0xF000, can_id=117)
+        #     await asyncio.sleep(0.5)
+
+        # Get motor configuration
+        await vesc.get_motor_config(can_id=can_id)
+        await asyncio.sleep(2)
+
+
 
     except Exception as e:
         print(f"Error: {e}")
