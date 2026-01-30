@@ -9,6 +9,9 @@ from typing import Optional
 import struct
 import math
 from enum import Enum, auto
+import inspect
+from pprint import pprint
+import logging
 
 class CommMode(Enum):
     SERIAL = auto()
@@ -52,7 +55,7 @@ def buffer_get_float32_auto(buffer: bytes, index: int) -> float:
     return decode_float32_auto(raw)
 
 class AsyncVESC_TCP:
-    def __init__(self, host: str, port: int = 65102, commMode: CommMode = CommMode.SERIAL):
+    def __init__(self, host: str, port: int = 65102, commMode: CommMode = CommMode.SERIAL, request_freq: float = 20.0):
         self.host = host
         self.port = port
         self.commMode = commMode
@@ -60,7 +63,14 @@ class AsyncVESC_TCP:
         self.writer: Optional[asyncio.StreamWriter] = None
         self.buffer = bytearray()
         self._receive_task: Optional[asyncio.Task] = None
+        self._request_task: Optional[asyncio.Task] = None
+        self.request_freq = request_freq
+        self._closing = False              # ← important flag
+        self._closed_event = asyncio.Event()  # signal that we're done
         self._lock = asyncio.Lock()  # To protect writer during sends
+        self.devices = {}  # can_id to device mapping
+        self.main_can_id = None
+        self.mc_config_id = None
 
     async def connect(self):
         """Establish TCP connection and start background receive task"""
@@ -83,18 +93,69 @@ class AsyncVESC_TCP:
         self._receive_task = asyncio.create_task(self._receive_loop())
 
     async def disconnect(self):
-        """Close connection gracefully"""
-        if self._receive_task:
-            self._receive_task.cancel()
-            try:
-                await self._receive_task
-            except asyncio.CancelledError:
-                pass
+        """Graceful shutdown — should be called only once ideally"""
+        if self._closing:
+            await self._closed_event.wait()   # already closing → just wait
+            return
 
-        if self.writer:
+        self._closing = True
+
+        # 1. Cancel background tasks (safe even if already done)
+        tasks_to_cancel = []
+        if self._receive_task and not self._receive_task.done():
+            tasks_to_cancel.append(self._receive_task)
+        if self._request_task and not self._request_task.done():
+            tasks_to_cancel.append(self._request_task)
+
+        for t in tasks_to_cancel:
+            t.cancel()
+
+        # 2. Wait for them (with timeout protection)
+        if tasks_to_cancel:
+            done, pending = await asyncio.wait(
+                tasks_to_cancel,
+                timeout=2.0,           # important safety net
+                return_when=asyncio.ALL_COMPLETED
+            )
+            for t in pending:
+                print(f"Task did not finish in time: {t.get_name() or t}")
+                # You can choose to t.cancel() again or just leave it
+
+        # 3. Close transport
+        if self.writer and not self.writer.is_closing():
             self.writer.close()
-            await self.writer.wait_closed()
-        print("Disconnected")
+            try:
+                await asyncio.wait_for(self.writer.wait_closed(), timeout=2.0)
+            except asyncio.TimeoutError:
+                print("writer.wait_closed() timed out")
+
+        self._closed_event.set()
+        print("Disconnected (clean shutdown)")
+
+    def add_device(self, device, can_id: int, main_device: bool = False):
+        """Register a device with a specific CAN ID"""
+        if main_device:
+            self.main_can_id = can_id
+            device.can_id = None
+        print(f"Added device with CAN ID {can_id}")
+        self.devices[can_id] = device
+
+    def enable_update(self):
+        """Start periodic status update requests for all devices"""
+        self._request_task = asyncio.create_task(self._request_status_update())
+
+    async def _request_status_update(self):
+        try:
+            while True:
+                for can_id, device in self.devices.items():
+                    await device.requestStatusUpdate()
+                await asyncio.sleep(1 / self.request_freq)  # Adjust the interval as needed
+        except Exception as e:
+            print(f"Request loop error: {e}")
+        finally:
+            if not self._closing:
+                # Only initiate close if nobody else is doing it
+                asyncio.create_task(self.disconnect())
 
     async def _receive_loop(self):
         """Background task: continuously read and decode incoming packets"""
@@ -112,7 +173,7 @@ class AsyncVESC_TCP:
                     if msg is None:
                         # Need more data
                         break
-
+                    
                     # Handle received message
                     await self._handle_message(msg)
 
@@ -124,18 +185,30 @@ class AsyncVESC_TCP:
         except Exception as e:
             print(f"Receive loop error: {e}")
         finally:
-            await self.disconnect()
+            if not self._closing:
+                # Only initiate close if nobody else is doing it
+                asyncio.create_task(self.disconnect())
 
     async def _handle_message(self, msg):
         """Override or extend this method to handle incoming messages"""
-        print(f"← Received: {msg.__class__.__name__}")
+        if hasattr(msg, 'app_controller_id'):
+            can_id = int.from_bytes(msg.app_controller_id, 'big') if isinstance(msg.app_controller_id, (bytes, bytearray)) else msg.app_controller_id
+        else:
+            can_id = self.mc_config_id
+            if can_id is None:
+                can_id = self.main_can_id
+        
 
+        logging.info(f"← Target ID: {can_id} Received: {msg.__class__.__name__}")
         # Example handlers
         if isinstance(msg, GetValues):
-            print(f"   RPM: {msg.rpm}")
-            print(f"   Duty Cycle: {msg.duty_cycle_now:.3f}")
-            print(f"   Current: {msg.avg_motor_current:.2f}A")
-            print(f"   PID Position: {msg.pid_pos_now:.2f}°")
+            # print(f"   RPM: {msg.rpm}")
+            # print(f"   Duty Cycle: {msg.duty_cycle_now:.3f}")
+            # print(f"   Current: {msg.avg_motor_current:.2f}A")
+            # print(f"   PID Position: {msg.pid_pos_now:.2f}°")
+            # print(f"Avg id: {msg.avg_id}, iq: {msg.avg_iq}")
+            self.devices[can_id].setMotorStatus(msg)
+
         # Add more as needed (e.g., GetRotorPosition, GetEncoder, etc.)
         if isinstance(msg, GetIMUData):
             quad_w = decode_float32_auto(msg.quad_w)
@@ -146,12 +219,13 @@ class AsyncVESC_TCP:
             
         # Mc Config
         if isinstance(msg, GetMcConf):
-            print(f"motor current max: {msg.l_current_max} A")
-            print(f"motor current min: {msg.l_current_min} A")
-            print(f"motor in current max: {msg.l_in_current_max} A")
-            print(f"motor in current min: {msg.l_in_current_min} A")
-            print(f"motor flux linkage: {msg.foc_motor_flux_linkage} mWb")
-            print(f"foc observer gain: {msg.foc_observer_gain}")
+            # print(f"motor current max: {msg.l_current_max} A")
+            # print(f"motor current min: {msg.l_current_min} A")
+            # print(f"motor in current max: {msg.l_in_current_max} A")
+            # print(f"motor in current min: {msg.l_in_current_min} A")
+            # print(f"motor flux linkage: {msg.foc_motor_flux_linkage} mWb")
+            # print(f"foc observer gain: {msg.foc_observer_gain}")
+            self.devices[can_id].setMotorConfig(msg)
 
     async def _send_packet(self, packet: bytes):
         """Internal: send raw packet with lock to prevent interleaving"""
@@ -165,35 +239,36 @@ class AsyncVESC_TCP:
         """Send COMM_SET_POS (position control)"""
         packet = pyvesc.encode(SetPosition(degrees, **kwargs))
         await self._send_packet(packet)
-        print(f"→ Sent SetPos: {degrees}°")
+        logging.info(f"→ Sent SetPos: {degrees}°")
 
     async def set_duty_cycle(self, duty: float, **kwargs):
         """Duty cycle from -1.0 to 1.0"""
         packet = pyvesc.encode(SetDutyCycle(duty))
         await self._send_packet(packet)
-        print(f"→ Sent SetDutyCycle: {duty:.3f}")
+        logging.info(f"→ Sent SetDutyCycle: {duty:.3f}")
 
     async def set_current(self, current_amps: float, **kwargs):
         packet = pyvesc.encode(SetCurrent(current_amps, **kwargs))
         await self._send_packet(packet)
-        print(f"→ Sent SetCurrent: {current_amps:.2f}A")
+        logging.info(f"→ Sent SetCurrent: {current_amps:.2f}A")
 
     async def set_rpm(self, rpm: int):
         packet = pyvesc.encode(SetRPM(rpm))
         await self._send_packet(packet)
-        print(f"→ Sent SetRPM: {rpm}")
+        logging.info(f"→ Sent SetRPM: {rpm}")
 
-    async def request_values(self):
+    async def get_values(self, can_id: int = None):
         """Request full GetValues struct"""
-        packet = pyvesc.encode_request(GetValues(can_id=117))
+        packet = pyvesc.encode_request(GetValues(can_id=can_id))
         await self._send_packet(packet)
-        print("→ Requested GetValues")
+        logging.info(f"→ Requested GetValues of can id {can_id}")
 
     async def get_motor_config(self, **kwargs):
         """Send COMM_GET_MCCONF to request motor configuration"""
+        self.mc_config_id = kwargs.get('can_id', None)
         packet = pyvesc.encode_request(GetMcConf(**kwargs))
         await self._send_packet(packet)
-        print("→ Requested Motor Configuration (COMM_GET_MCCONF)")
+        logging.info("→ Requested Motor Configuration (COMM_GET_MCCONF)")
 
     async def request_imu_data(self, mask: int = 0xFFFF, can_id: int | None = None):
         """
@@ -216,7 +291,7 @@ class AsyncVESC_TCP:
         
         await self._send_packet(packet)
         target = f" (CAN ID {can_id})" if can_id else ""
-        print(f"→ Requested IMU Data (mask=0x{mask:04X}){target}")
+        logging.info(f"→ Requested IMU Data (mask=0x{mask:04X}){target}")
 # === Example Usage ===
 async def main():
     # vesc = AsyncVESC_TCP("192.168.0.146", 65102)  # Replace with your TCP bridge IP
@@ -225,7 +300,7 @@ async def main():
     try:
         await vesc.connect()
 
-        # # Example: send position commands synchronously
+        # Example: send position commands synchronously
         # await vesc.set_position(0.0, can_id=can_id)
         # await asyncio.sleep(2)
 
@@ -235,26 +310,27 @@ async def main():
         # await vesc.set_position(180.0, can_id=can_id)
         # await asyncio.sleep(2)
 
-        # Example: current control
-        await vesc.set_current(1.0)  # 0.1A
-        await asyncio.sleep(2)
-        await vesc.set_current(0.0)  # 0.1A
-        await asyncio.sleep(2)
+        # # Example: current control
+        # await vesc.set_current(1.0)  # 0.1A
+        # await asyncio.sleep(2)
+        # await vesc.set_current(0.0)  # 0.1A
+        # await asyncio.sleep(2)
 
 
         # # Request imu data
         # while True:
-        #     await vesc.request_imu_data(mask=0xF000, can_id=117)
+        #     await vesc.request_imu_data(mask=0xF000, can_id=None)
         #     await asyncio.sleep(0.5)
 
         # Get motor configuration
-        await vesc.get_motor_config(can_id=can_id)
-        await asyncio.sleep(2)
+        await vesc.get_values(can_id=can_id)
+        await vesc.get_values(can_id=21)
+        await asyncio.sleep(0.2)
 
 
 
     except Exception as e:
-        print(f"Error: {e}")
+        logging.error(f"Error: {e}")
     finally:
         await vesc.disconnect()
 
