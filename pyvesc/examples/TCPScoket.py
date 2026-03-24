@@ -207,6 +207,15 @@ class AsyncVESC_TCP:
             # print(f"   Current: {msg.avg_motor_current:.2f}A")
             # print(f"   PID Position: {msg.pid_pos_now:.2f}°")
             # print(f"Avg id: {msg.avg_id}, iq: {msg.avg_iq}")
+            # print(f"CAN ID {can_id} - RPM: {msg.rpm}, Current: {msg.avg_motor_current:.2f}A, PID Pos: {msg.pid_pos_now:.2f}°")
+
+            self.devices[can_id].setMotorStatus(msg)
+
+        if isinstance(msg, GetValuesSelective):
+            # print(msg.avg_motor_current)
+            # print(msg.rpm)
+            # print(msg.pid_pos_now)
+            # print(f"CAN ID {can_id} - RPM: {msg.rpm}, Current: {msg.avg_motor_current:.2f}A, PID Pos: {msg.pid_pos_now:.2f}°")
             self.devices[can_id].setMotorStatus(msg)
 
         # Add more as needed (e.g., GetRotorPosition, GetEncoder, etc.)
@@ -292,6 +301,24 @@ class AsyncVESC_TCP:
         await self._send_packet(packet)
         target = f" (CAN ID {can_id})" if can_id else ""
         logging.info(f"→ Requested IMU Data (mask=0x{mask:04X}){target}")
+
+    async def get_values_selective(self, mask: int = 0xFFFF, can_id: int = None):
+        """Request selective values (e.g., current, rpm, position)"""
+        # Build payload: command ID (1 byte) + mask (4 bytes big-endian)
+        payload = struct.pack('>BI', VedderCmd.COMM_GET_VALUES_SELECTIVE, mask)  # > = big-endian, B=uint8, H=uint16
+        
+        if can_id is not None:
+            # For CAN forwarding: prepend COMM_FORWARD_CAN (usually 34) + can_id
+            # Adjust 34 if your firmware uses a different value (rare)
+            payload = struct.pack('>BB', VedderCmd.COMM_FORWARD_CAN, can_id) + payload
+        
+        # Encode the full VESC packet (handles start/stop bytes, length, CRC)
+        packet = pyvesc.protocol.packet.codec.frame(payload)
+        await self._send_packet(packet)
+        target = f" (CAN ID {can_id})" if can_id else ""
+        logging.info(f"→ Requested Selective Values (mask=0x{mask:04X}){target}")
+
+
 # === Example Usage ===
 async def main():
     # vesc = AsyncVESC_TCP("192.168.0.146", 65102)  # Replace with your TCP bridge IP

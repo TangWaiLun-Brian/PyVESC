@@ -65,6 +65,18 @@ class GetValues(metaclass=VESCMessage):
         ('time_ms', 'i', 1),
     ]
 
+class GetValuesSelective(metaclass=VESCMessage):
+    """ Gets selective internal sensor data
+    """
+    id = VedderCmd.COMM_GET_VALUES_SELECTIVE
+
+    fields = [
+        ('mask', 'i', 0),
+        ('avg_motor_current', 'i', 100),
+        ('rpm', 'i', 1),
+        ('pid_pos_now', 'i', 1000000),
+        ('app_controller_id', 'c', 0),
+    ]
 
 class GetRotorPosition(metaclass=VESCMessage):
     """ Gets rotor position data
