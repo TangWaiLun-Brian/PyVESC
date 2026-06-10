@@ -1,10 +1,11 @@
 import asyncio
 import serial_asyncio
 import serial
+import socket  
 import pyvesc
 from pyvesc.VESC.messages import *
 from pyvesc.VESC.messages.setters import SetDutyCycle, SetCurrent, SetRPM
-from pyvesc.VESC.messages.getters import GetValues, GetRotorPosition, GetIMUData, GetMcConf
+from pyvesc.VESC.messages.getters import GetValues, GetRotorPosition, GetIMUData, GetMcConf, GetIOBoardData, GetDecodedADC
 from typing import Optional
 import struct
 import math
@@ -12,7 +13,10 @@ from enum import Enum, auto
 import inspect
 from pprint import pprint
 import logging
-
+import sys
+if sys.platform == 'win32':
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    
 class CommMode(Enum):
     SERIAL = auto()
     TCP = auto()
@@ -24,6 +28,10 @@ class ControlMode(Enum):
     RPM = auto()
     POSITION = auto()
 
+class SensorType(Enum):
+    IMU = auto()
+    LOAD_CELL = auto()
+    ADC = auto()
 
 def decode_float32_auto(raw_uint32: int) -> float:
     """Decode a float encoded with buffer_append_float32_auto"""
@@ -68,7 +76,10 @@ class AsyncVESC_TCP:
         self._closing = False              # ← important flag
         self._closed_event = asyncio.Event()  # signal that we're done
         self._lock = asyncio.Lock()  # To protect writer during sends
-        self.devices = {}  # can_id to device mapping
+        self.motors = {}  # can_id to motor mapping
+        self.sensor_requests = []
+        self.imu_s = {}
+        self.adc_s = {}
         self.main_can_id = None
         self.mc_config_id = None
 
@@ -76,6 +87,9 @@ class AsyncVESC_TCP:
         """Establish TCP connection and start background receive task"""
         if self.commMode == CommMode.TCP:
             self.reader, self.writer = await asyncio.open_connection(self.host, self.port)
+            sock = self.writer.get_extra_info('socket')
+            if sock:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             print(f"Connected to VESC at {self.host}:{self.port} via TCP")
         elif self.commMode == CommMode.SERIAL:
             self.reader, self.writer = await serial_asyncio.open_serial_connection(
@@ -132,13 +146,41 @@ class AsyncVESC_TCP:
         self._closed_event.set()
         print("Disconnected (clean shutdown)")
 
-    def add_device(self, device, can_id: int, main_device: bool = False):
-        """Register a device with a specific CAN ID"""
+    def add_sensor2(self, device):
+        device_can_id = device.can_id
+        if self.main_can_id == device.can_id:
+            device.can_id = None
+
+        if device.type == SensorType.IMU:
+            self.imu_s[device_can_id] = device
+        elif device.type == SensorType.ADC:
+            self.adc_s[device_can_id] = device
+        else:
+            raise NotImplementedError(f"Support for device type '{device.sensor_type}' has not been implemented yet.")
+
+    def add_sensor(self, device_type: SensorType, can_id: int | None=None, *args, **kwargs):
+        if self.main_can_id == can_id:
+            can_id = None
+        if device_type == SensorType.IMU:
+            request_func = lambda cid, a=args, k=kwargs: self.request_imu_data(can_id=cid, *a, **k)
+            self.sensor_requests.append((can_id, request_func))
+        elif device_type == SensorType.ADC:
+            request_func = lambda cid, a=args, k=kwargs: self.request_ioboard_data(can_id=cid, *a, **k)
+            self.sensor_requests.append((can_id, request_func))
+        else:
+            raise NotImplementedError(f"Support for device type '{device_type}' has not been implemented yet.")
+        
+    def add_motor(self, motor, can_id: int, main_device: bool = False):
+        """Register a motor with a specific CAN ID"""
         if main_device:
             self.main_can_id = can_id
-            device.can_id = None
-        print(f"Added device with CAN ID {can_id}")
-        self.devices[can_id] = device
+            motor.can_id = None
+        print(f"Added motor with CAN ID {can_id}")
+        self.motors[can_id] = motor
+
+    def set_motor_encoder_offsets(self):
+        for motor in self.motors.values():
+            motor.setEncoderOffset()
 
     def enable_update(self):
         """Start periodic status update requests for all devices"""
@@ -147,8 +189,16 @@ class AsyncVESC_TCP:
     async def _request_status_update(self):
         try:
             while True:
-                for can_id, device in self.devices.items():
-                    await device.requestStatusUpdate()
+                for can_id, motor in self.motors.items():
+                    await motor.requestStatusUpdate()
+                
+                # for can_id, request_func in self.sensor_requests:
+                #     await request_func(can_id)
+                for can_id, imu in self.imu_s.items():
+                    await imu.requestStatusUpdate()
+                for can_id, adc in self.adc_s.items():
+                    await adc.requestStatusUpdate()
+
                 await asyncio.sleep(1 / self.request_freq)  # Adjust the interval as needed
         except Exception as e:
             print(f"Request loop error: {e}")
@@ -161,7 +211,7 @@ class AsyncVESC_TCP:
         """Background task: continuously read and decode incoming packets"""
         try:
             while True:
-                data = await self.reader.read(100)
+                data = await self.reader.read(4096)
                 if not data:
                     print("Connection closed by remote")
                     break
@@ -209,23 +259,30 @@ class AsyncVESC_TCP:
             # print(f"Avg id: {msg.avg_id}, iq: {msg.avg_iq}")
             # print(f"CAN ID {can_id} - RPM: {msg.rpm}, Current: {msg.avg_motor_current:.2f}A, PID Pos: {msg.pid_pos_now:.2f}°")
 
-            self.devices[can_id].setMotorStatus(msg)
+            self.motors[can_id].setMotorStatus(msg)
 
         if isinstance(msg, GetValuesSelective):
             # print(msg.avg_motor_current)
             # print(msg.rpm)
             # print(msg.pid_pos_now)
             # print(f"CAN ID {can_id} - RPM: {msg.rpm}, Current: {msg.avg_motor_current:.2f}A, PID Pos: {msg.pid_pos_now:.2f}°")
-            self.devices[can_id].setMotorStatus(msg)
+            self.motors[can_id].setMotorStatus(msg)
 
         # Add more as needed (e.g., GetRotorPosition, GetEncoder, etc.)
         if isinstance(msg, GetIMUData):
+            rpy_x = decode_float32_auto(msg.rpy_x)
+            rpy_y = decode_float32_auto(msg.rpy_y)
+            rpy_z = decode_float32_auto(msg.rpy_z)
             quad_w = decode_float32_auto(msg.quad_w)
             quad_x = decode_float32_auto(msg.quad_x)
             quad_y = decode_float32_auto(msg.quad_y)
             quad_z = decode_float32_auto(msg.quad_z)
-            print(f"   Quaternion: w={quad_w:.4f}, x={quad_x:.4f}, y={quad_y:.4f}, z={quad_z:.4f}")
-            
+            # print(f"   Quaternion: w={quad_w:.4f}, x={quad_x:.4f}, y={quad_y:.4f}, z={quad_z:.4f}")
+            self.imu_s[can_id].setStatus((rpy_x, rpy_y, rpy_z), (quad_w, quad_x, quad_y, quad_z))
+        
+        if isinstance(msg, GetDecodedADC):
+            print(f"{msg.decoded_level:2f}, {msg.voltage:.2f}V, {msg.decoded_level2:2f}, {msg.voltage2:.2f}V")
+
         # Mc Config
         if isinstance(msg, GetMcConf):
             # print(f"motor current max: {msg.l_current_max} A")
@@ -234,57 +291,23 @@ class AsyncVESC_TCP:
             # print(f"motor in current min: {msg.l_in_current_min} A")
             # print(f"motor flux linkage: {msg.foc_motor_flux_linkage} mWb")
             # print(f"foc observer gain: {msg.foc_observer_gain}")
-            self.devices[can_id].setMotorConfig(msg)
+            self.motors[can_id].setMotorConfig(msg)
 
     async def _send_packet(self, packet: bytes):
-        """Internal: send raw packet with lock to prevent interleaving"""
         async with self._lock:
             self.writer.write(packet)
-            await self.writer.drain()
+            # Only drain if the buffer is getting significantly large
+            if self.writer.transport.get_write_buffer_size() > 1024:
+                await self.writer.drain()
 
     # === Synchronous-style command functions ===
 
-    async def set_position(self, degrees: float, **kwargs):
-        """Send COMM_SET_POS (position control)"""
-        packet = pyvesc.encode(SetPosition(degrees, **kwargs))
-        await self._send_packet(packet)
-        logging.info(f"→ Sent SetPos: {degrees}°")
-
-    async def set_duty_cycle(self, duty: float, **kwargs):
-        """Duty cycle from -1.0 to 1.0"""
-        packet = pyvesc.encode(SetDutyCycle(duty))
-        await self._send_packet(packet)
-        logging.info(f"→ Sent SetDutyCycle: {duty:.3f}")
-
-    async def set_current(self, current_amps: float, **kwargs):
-        packet = pyvesc.encode(SetCurrent(current_amps, **kwargs))
-        await self._send_packet(packet)
-        logging.info(f"→ Sent SetCurrent: {current_amps:.2f}A")
-
-    async def set_rpm(self, rpm: int):
-        packet = pyvesc.encode(SetRPM(rpm))
-        await self._send_packet(packet)
-        logging.info(f"→ Sent SetRPM: {rpm}")
-
-    async def get_values(self, can_id: int = None):
-        """Request full GetValues struct"""
-        packet = pyvesc.encode_request(GetValues(can_id=can_id))
-        await self._send_packet(packet)
-        logging.info(f"→ Requested GetValues of can id {can_id}")
-
-    async def get_motor_config(self, **kwargs):
-        """Send COMM_GET_MCCONF to request motor configuration"""
-        self.mc_config_id = kwargs.get('can_id', None)
-        packet = pyvesc.encode_request(GetMcConf(**kwargs))
-        await self._send_packet(packet)
-        logging.info("→ Requested Motor Configuration (COMM_GET_MCCONF)")
-
-    async def request_imu_data(self, mask: int = 0xFFFF, can_id: int | None = None):
+    async def request_imu_data(self, mask: int = 0xF007, can_id: int | None = None):
         """
         Send COMM_GET_IMU_DATA request.
         Recommended masks:
-        - 0x3FF  : Roll, pitch, yaw + accel (x/y/z) + gyro (x/y/z)  → most common (9 floats)
-        - 0xFFFF : Everything (including quaternion if firmware supports it)
+        - 0xF000  : Quaternion (w/x/y/z)
+        - 0xF007 : Quaternion (w/x/y/z) + Roll,Pitch,Yaw
         """
         # Build payload: command ID (1 byte) + mask (2 bytes big-endian)
         payload = struct.pack('>BH', VedderCmd.COMM_GET_IMU_DATA, mask)  # > = big-endian, B=uint8, H=uint16
@@ -301,11 +324,15 @@ class AsyncVESC_TCP:
         await self._send_packet(packet)
         target = f" (CAN ID {can_id})" if can_id else ""
         logging.info(f"→ Requested IMU Data (mask=0x{mask:04X}){target}")
+    
+    async def request_ioboard_data(self, mask: int = 0x00FF, can_id: int | None = None):
+        """
+        Send COMM_GET_IO_BOARD_DATA request.
+        Recommended masks:
 
-    async def get_values_selective(self, mask: int = 0xFFFF, can_id: int = None):
-        """Request selective values (e.g., current, rpm, position)"""
-        # Build payload: command ID (1 byte) + mask (4 bytes big-endian)
-        payload = struct.pack('>BI', VedderCmd.COMM_GET_VALUES_SELECTIVE, mask)  # > = big-endian, B=uint8, H=uint16
+        """
+        # Build payload: command ID (1 byte) + mask (2 bytes big-endian)
+        payload = struct.pack('>BH', VedderCmd.COMM_IO_BOARD_GET_ALL, mask)  # > = big-endian, B=uint8, H=uint16
         
         if can_id is not None:
             # For CAN forwarding: prepend COMM_FORWARD_CAN (usually 34) + can_id
@@ -314,9 +341,15 @@ class AsyncVESC_TCP:
         
         # Encode the full VESC packet (handles start/stop bytes, length, CRC)
         packet = pyvesc.protocol.packet.codec.frame(payload)
+
+        
         await self._send_packet(packet)
-        target = f" (CAN ID {can_id})" if can_id else ""
-        logging.info(f"→ Requested Selective Values (mask=0x{mask:04X}){target}")
+        target = f" (CAN ID {can_id})" if can_id else " self"
+        logging.info(f"→ Requested IO Board Data (mask=0x{mask:04X}){target}")
+
+        # packet = pyvesc.encode_request(GetDecodedADC(can_id=can_id))
+        # await self._send_packet(packet)
+        # logging.info(f"→ Requested GetDecodedADC of can id {can_id}")
 
 
 # === Example Usage ===
@@ -346,7 +379,7 @@ async def main():
 
         # # Request imu data
         # while True:
-        #     await vesc.request_imu_data(mask=0xF000, can_id=None)
+        #     await vesc.request_imu_data(mask=0xF007, can_id=None)
         #     await asyncio.sleep(0.5)
 
         # Get motor configuration

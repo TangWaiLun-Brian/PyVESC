@@ -78,6 +78,50 @@ class GetValuesSelective(metaclass=VESCMessage):
         ('app_controller_id', 'c', 0),
     ]
 
+class GetDecodedADC(metaclass=VESCMessage):
+    """
+    Class for COMM_GET_DECODED_ADC.
+    Parses the decoded levels and actual voltages for both ADC1 and ADC2.
+    """
+    id = VedderCmd.COMM_GET_DECODED_ADC
+
+    fields = [
+        ('decoded_level', 'i', 1000000),   # int32_t, scaled by 1e6
+        ('voltage', 'i', 1000000),         # int32_t, scaled by 1e6
+        ('decoded_level2', 'i', 1000000),  # int32_t, scaled by 1e6
+        ('voltage2', 'i', 1000000)         # int32_t, scaled by 1e6
+    ]
+
+class GetIOBoardData(metaclass=VESCMessage):
+    id = VedderCmd.COMM_IO_BOARD_GET_ALL
+
+    fields = [
+        # --- Header ---
+        ('io_board_id', 'h', 0),            # int16_t (2 bytes)
+
+        # --- Block 1: ADC 1 to 4 ---
+        ('block1_id', 'c', 0),             # uint8_t (1 byte), always 1
+        ('adc_1_4_rx_time', 'f', 4),        # float32_auto bypass (raw 4 bytes)
+        ('adc1', 'h', 100),                 # float16 scaled by 1e2
+        ('adc2', 'h', 100),                 # float16 scaled by 1e2
+        ('adc3', 'h', 100),                 # float16 scaled by 1e2
+        ('adc4', 'h', 100),                 # float16 scaled by 1e2
+
+        # --- Block 2: ADC 5 to 8 ---
+        ('block2_id', 'c', 0),             # uint8_t (1 byte), always 2
+        ('adc_5_8_rx_time', 'f', 4),        # float32_auto bypass (raw 4 bytes)
+        ('adc5', 'h', 100),                 # float16 scaled by 1e2
+        ('adc6', 'h', 100),                 # float16 scaled by 1e2
+        ('adc7', 'h', 100),                 # float16 scaled by 1e2
+        ('adc8', 'h', 100),                 # float16 scaled by 1e2
+
+        # --- Block 3: Digital Inputs ---
+        ('block3_id', 'c', 0),             # uint8_t (1 byte), always 3
+        ('digital_rx_time', 'f', 4),        # float32_auto bypass (raw 4 bytes)
+        ('digital_in_high', 'i', 0),        # uint32_t top 32-bits
+        ('digital_in_low', 'i', 0)          # uint32_t bottom 32-bits
+    ]
+
 class GetRotorPosition(metaclass=VESCMessage):
     """ Gets rotor position data
     
@@ -98,9 +142,9 @@ class GetIMUData(metaclass=VESCMessage):
     fields = [
         # ('packet_id', 'c', 0),
         ('mask', 'h', 0),
-        # ('rpy_x', 'i', 0),
-        # ('rpy_y', 'i', 0),
-        # ('rpy_z', 'i', 0),
+        ('rpy_x', 'i', 0),
+        ('rpy_y', 'i', 0),
+        ('rpy_z', 'i', 0),
         # ('acc_x', 'i', 0),
         # ('acc_y', 'i', 0),
         # ('acc_z', 'i', 0),
