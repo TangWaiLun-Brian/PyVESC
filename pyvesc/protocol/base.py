@@ -115,7 +115,10 @@ class VESCMessage(type):
                 field_values.append(getattr(instance, field_name))
         else:
             for field_name, field_scalar in zip(instance._field_names, instance._field_scalars):
-                field_values.append(int(getattr(instance, field_name) * field_scalar))
+                if field_scalar != 0:
+                    field_values.append(int(getattr(instance, field_name) * field_scalar))
+                else:
+                    field_values.append(getattr(instance, field_name))
         if not (instance._string_field is None):
             # string field
             string_field_name = instance._field_names[instance._string_field]

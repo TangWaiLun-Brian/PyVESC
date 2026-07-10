@@ -100,11 +100,52 @@ class VESC(object):
         :param num_read_bytes: number of bytes to read for decoding response
         :return: decoded response from buffer
         """
+        """
+        Patched write wrapper to handle VESC FW 6.x long packets.
+        Bypasses the in_waiting deadlock by stream-reading the exact packet size.
+        """
+        self.serial_port.reset_input_buffer()
         self.serial_port.write(data)
+        
         if num_read_bytes is not None:
-            while self.serial_port.in_waiting <= num_read_bytes:
-                time.sleep(0.000001)  # add some delay just to help the CPU
-            response, consumed = decode(self.serial_port.read(self.serial_port.in_waiting))
+            # 1. Read the very first byte (blocking) to see packet type
+            start_byte = self.serial_port.read(1)
+            
+            if not start_byte:
+                print("VESC Timeout: No response received.")
+                return None
+                
+            # 2. Read length based on packet type
+            if start_byte == b'\x02':
+                # Short packet
+                length_bytes = self.serial_port.read(1)
+                payload_len = length_bytes[0]
+            elif start_byte == b'\x03':
+                # Long packet (FW 6.x)
+                length_bytes = self.serial_port.read(2)
+                payload_len = (length_bytes[0] << 8) | length_bytes[1]
+            else:
+                print(f"VESC Error: Invalid start byte: {start_byte}")
+                # Flush the corrupted buffer
+                self.serial_port.reset_input_buffer() 
+                return None
+                
+            # 3. Calculate remaining bytes (payload + 2-byte CRC + 1-byte stop)
+            bytes_remaining = payload_len + 3
+            
+            # 4. Read the rest of the packet. 
+            # Because this is a single .read(), PySerial handles pulling data
+            # out of the OS buffer as it arrives, preventing the 490-byte lockup!
+            rest_of_packet = self.serial_port.read(bytes_remaining)
+            
+            if len(rest_of_packet) < bytes_remaining:
+                print("VESC Error: Packet timed out before finishing.")
+                return None
+                
+            # 5. Reassemble and decode
+            full_packet = start_byte + length_bytes + rest_of_packet
+            response, consumed = decode(full_packet)
+            
             return response
 
     def set_rpm(self, new_rpm, **kwargs):
