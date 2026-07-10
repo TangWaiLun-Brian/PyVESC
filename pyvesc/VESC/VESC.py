@@ -224,7 +224,32 @@ class VESC(object):
         :return: Current incoming current
         """
         return self.get_measurements().current_in
+    
+    def get_mc_conf(self, **kwargs):
+        """
+        :return: Current motor configuration
+        """
+        msg = GetMcConf(**kwargs)
+        response = self.write(encode_request(msg), num_read_bytes=msg._full_msg_size)
+        return response
 
+    def set_mc_conf(self, mc_conf, **kwargs):
+        """
+        :param mc_conf: New motor configuration
+        """
+        field_names = [field[0] for field in SetMcConf.fields]
+        if isinstance(mc_conf, dict):
+            values = [mc_conf[name] for name in field_names]
+        else:
+            values = [getattr(mc_conf, name) for name in field_names]
+            
+        conf = SetMcConf(*values, **kwargs)
+        bs = encode(conf)
+        print(f"conf: {conf}, length: {len(bs)}, full_msg_size: {conf._full_msg_size}")
+        print(f"pid_kp: {conf.p_pid_kp}")
+        print(f"can_id: {conf.can_id}")
+
+        self.write(bs)
 
 
 
